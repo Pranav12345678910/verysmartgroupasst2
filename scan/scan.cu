@@ -29,6 +29,45 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void upSweep(int* device_data, int twod1, int twod, int kernelCount)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < kernelCount) {
+        int i = twod1 * tid;
+        device_data[i + twod1 - 1] += device_data[i + twod - 1];
+    }
+
+}
+
+__global__ void downSweep(int* device_data, int twod1, int twod, int kernelCount)
+{
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < kernelCount) {
+        int i = twod1 * tid;
+        int t = device_data[i + twod - 1];
+        device_data[i + twod - 1] = device_data[i + twod1 - 1];
+        device_data[i + twod1 - 1] += t;
+    }
+}
+
+int roundToPowerOf2(int input) {
+
+    input--;
+
+    input |= input >> 1;
+    input |= input >> 2;
+    input |= input >> 4;
+    input |= input >> 8;
+    input |= input >> 16;
+
+    input ++;
+
+    return input;
+
+}
+
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +82,42 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+
+
+
+    int N = roundToPowerOf2(length);
+
+    if (N > length) {
+        cudaMemset(device_data + length, 0, (N - length) * sizeof(int));
+    }
+
+    int threadsPerBlock = 256;
+    int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+    // upsweep phase.
+    for (int twod = 1; twod < N; twod*=2)
+    {
+        // we want N/twod1 runs of the loop
+        int twod1 = twod * 2;
+        int kernelCount = N/twod1;
+        int threadsPerBlock = 256;
+        int blocks = (kernelCount + threadsPerBlock - 1)/threadsPerBlock;
+
+        upSweep<<<blocks, threadsPerBlock>>>(device_data, twod1, twod, kernelCount);
+    }
+
+    cudaMemset(device_data + (N - 1), 0, sizeof(int));
+
+    // downsweep phase.
+    for (int twod = N/2; twod >= 1; twod /= 2)
+    {
+        int twod1 = twod * 2;
+        int kernelCount = N/twod1;
+        int threadsPerBlock = 256;
+        int blocks = (kernelCount + threadsPerBlock - 1)/threadsPerBlock;
+
+        downSweep<<<blocks, threadsPerBlock>>>(device_data, twod1, twod, kernelCount);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
