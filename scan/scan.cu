@@ -51,23 +51,6 @@ __global__ void downSweep(int* device_data, int twod1, int twod, int kernelCount
     }
 }
 
-int roundToPowerOf2(int input) {
-
-    input--;
-
-    input |= input >> 1;
-    input |= input >> 2;
-    input |= input >> 4;
-    input |= input >> 8;
-    input |= input >> 16;
-
-    input ++;
-
-    return input;
-
-}
-
-
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -85,14 +68,11 @@ void exclusive_scan(int* device_data, int length)
 
 
 
-    int N = roundToPowerOf2(length);
+    int N = nextPow2(length);
 
     if (N > length) {
         cudaMemset(device_data + length, 0, (N - length) * sizeof(int));
     }
-
-    int threadsPerBlock = 256;
-    int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
 
     // upsweep phase.
     for (int twod = 1; twod < N; twod*=2)
@@ -183,6 +163,19 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void findPeak(int* device_input, int* peak, int kernelCount) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == kernelCount - 1 || i == 0) peak[i] = 0;
+    else if (device_input[i] > device_input[i - 1] && device_input[i] > device_input[i + 1]) peak[i] = 1;
+    else peak[i] = 0;
+}
+
+__global__ void findPos(int* pos, int* peak, int* output, int kernelCount) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (peak[i] == 1) {
+        output[pos[i]] = i;
+    }
+}
 
 
 int find_peaks(int *device_input, int length, int *device_output) {
@@ -200,7 +193,58 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
+    int* device_peak;
+    cudaMalloc((void **)&device_peak, sizeof(int) * length);
+
+    int kernelCount = length;
+    int threadsPerBlock = 256;
+    int blocks = (kernelCount + threadsPerBlock - 1)/threadsPerBlock;
+    findPeak<<<blocks, threadsPerBlock>>>(device_input, device_peak, kernelCount);
+
+    // int* host_peak = (int*) malloc(length * sizeof(int));
+    // int* host_input = (int*) malloc(length * sizeof(int));
+    // cudaMemcpy(host_peak, device_peak, length * sizeof(int), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(host_input, device_input, length * sizeof(int), cudaMemcpyDeviceToHost);
+   
+    /*   
+    std::cerr << "Inputs: \n";
+    for (int i = length - 10; i < length; i++) {
+        std::cerr << std::to_string(host_input[i]) + ", ";
+    }
+    std::cerr << "\nPeaks: \n";
+    for (int i = length - 10; i < length; i++) {
+        std::cerr << std::to_string(host_peak[i]) + ", ";
+    }
+    std::cerr << "\n";
+    */
+
+    int* pos;
+    int rounded_length = nextPow2(length);
+    cudaMalloc((void **)&pos, sizeof(int) * rounded_length);
+    cudaMemcpy(pos, device_peak, length * sizeof(int), cudaMemcpyDeviceToDevice);
+    
+    cudaMemset(pos + length, 0, (rounded_length - length) * sizeof(int));
+
+    exclusive_scan(pos, length);
+
+    // int* host_pos = (int*) malloc(sizeof(int) * length);
+    // cudaMemcpy(host_pos, pos, length * sizeof(int), cudaMemcpyDeviceToHost);
+
+    /*
+    std::cerr << "Pos: \n";
+    for (int i = length - 10; i < length; i++) {
+        std::cerr << std::to_string(host_pos[i]) + " ";
+    }
+    std::cerr << "\n";
+    */
+
+    findPos<<<blocks, threadsPerBlock>>>(pos, device_peak, device_output, kernelCount);
+
+    int res;
+    cudaMemcpy(&res, pos + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(pos);
+    cudaFree(device_peak);
+    return res;
 }
 
 
