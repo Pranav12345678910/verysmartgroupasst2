@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <vector>
+#include <iostream>
 
 
 
@@ -651,12 +652,398 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+
+__global__ void upSweep(int* device_data, int twod1, int twod, int kernelCount)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < kernelCount) {
+        int i = twod1 * tid;
+        device_data[i + twod1 - 1] += device_data[i + twod - 1];
+    }
+
+}
+
+__global__ void downSweep(int* device_data, int twod1, int twod, int kernelCount)
+{
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < kernelCount) {
+        int i = twod1 * tid;
+        int t = device_data[i + twod - 1];
+        device_data[i + twod - 1] = device_data[i + twod1 - 1];
+        device_data[i + twod1 - 1] += t;
+    }
+}
+
+int roundToPowerOf2(int input) {
+
+    input--;
+
+    input |= input >> 1;
+    input |= input >> 2;
+    input |= input >> 4;
+    input |= input >> 8;
+    input |= input >> 16;
+
+    input ++;
+
+    return input;
+
+}
+
+
+void exclusive_scan(int* device_data, int length)
+{
+    /* TODO
+     * Fill in this function with your exclusive scan implementation.
+     * You are passed the locations of the data in device memory
+     * The data are initialized to the inputs.  Your code should
+     * do an in-place scan, generating the results in the same array.
+     * This is host code -- you will need to declare one or more CUDA
+     * kernels (with the __global__ decorator) in order to actually run code
+     * in parallel on the GPU.
+     * Note you are given the real length of the array, but may assume that
+     * both the data array is sized to accommodate the next
+     * power of 2 larger than the input.
+     */
+
+    // int* device_dataHost = (int*) malloc(sizeof(int) * length);
+    // cudaMemcpy(device_dataHost, device_data, sizeof(int) * length, cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < length; i++) {
+    //     printf("%d, ", device_dataHost[i]);
+    // }
+
+
+    // int* device_dataHost = (int*) malloc(sizeof(int) * length);
+    // cudaMemcpy(device_dataHost, device_data, sizeof(int) * length, cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < length; i++) {
+    //     printf("%d, ", device_dataHost[i]);
+    // }
+    // printf("\n\nHELLOOOO\n\n");
+
+    int N = roundToPowerOf2(length);
+
+    if (N > length) {
+        cudaMemset(device_data + length, 0, (N - length) * sizeof(int));
+    }
+
+    // int threadsPerBlock = 256;
+    // int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+    // upsweep phase.
+    for (int twod = 1; twod < N; twod*=2)
+    {
+        // we want N/twod1 runs of the loop
+        int twod1 = twod * 2;
+        int kernelCount = N/twod1;
+        int threadsPerBlock = 256;
+        int blocks = (kernelCount + threadsPerBlock - 1)/threadsPerBlock;
+
+        upSweep<<<blocks, threadsPerBlock>>>(device_data, twod1, twod, kernelCount);
+    }
+
+    cudaMemset(device_data + (N - 1), 0, sizeof(int));
+
+    // downsweep phase.
+    for (int twod = N/2; twod >= 1; twod /= 2)
+    {
+        int twod1 = twod * 2;
+        int kernelCount = N/twod1;
+        int threadsPerBlock = 256;
+        int blocks = (kernelCount + threadsPerBlock - 1)/threadsPerBlock;
+
+        downSweep<<<blocks, threadsPerBlock>>>(device_data, twod1, twod, kernelCount);
+    }
+}
+
+__global__ void circleTouching(int *circleTouch, int *circles) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index > 0 && circleTouch[index] > circleTouch[index-1]) {
+        circles[circleTouch[index-1]] = index-1;
+    }
+}
+
+__global__ void circleToucher(float2 pixelCenter, int* output) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // figure out if pixel is in circle at index
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[index * 3]);
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = cuConstRendererParams.radius[index];
+    float maxDist = rad * rad;
+
+    // pixel not in circle
+    if (pixelDist > maxDist) {
+        output[index] = 0;
+    }
+    else {
+        output[index] = 1;
+    }
+        
+}
+
+// __global__ void kernelRenderCircles2() {
+//     int imageWidth = cuConstRendererParams.imageWidth;
+//     int imageHeight = cuConstRendererParams.imageHeight;
+//     int numberOfCircles = cuConstRendererParams.numberOfCircles;
+
+//     float invWidth = 1.f / imageWidth;
+//     float invHeight = 1.f / imageHeight;
+
+//     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+//     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+//     int* circleTouch;
+//     cudaMalloc(&circleTouch, sizeof(int) * (numberOfCircles + 1));
+
+//     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+//                                          invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+//     dim3 blockDim(256, 1);
+//     dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
+//     circleToucher<<<gridDim, blockDim>>>(pixelCenterNorm, circleTouch);
+//     circleTouch[numberOfCircles] = 0;
+
+//     exclusive_scan(circleTouch, numberOfCircles + 1);
+
+//     int circleTouchLengh;
+//     cudaMemcpy(&circleTouchLengh, circleTouch + numberOfCircles + 1, sizeof(int), cudaMemcpyDeviceToHost);
+//     int* circles;
+//     cudaMalloc(&circles, sizeof(int) * circleTouchLengh);
+
+//     circleTouching<<<gridDim, blockDim>>>(circleTouch, circles);
+
+//     for (int i = 0; i < len(circles); i++) {
+//         int circleIndex = circles[i];
+//         float3 p = *(float3*)(&cuConstRendererParams.position[3*circleIndex]);
+//         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+//         shadePixel(pixelCenterNorm, p, imgPtr, index);
+//     }
+// }
+
+__global__ void kernel4(int* zerosandones, int* lengths, int numPixels) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index >= numPixels) {
+        return;
+    }
+
+    int numberCirclePixelIndex = (index + 1) * cuConstRendererParams.numberOfCircles;
+    lengths[index] = zerosandones[numberCirclePixelIndex];
+}
+
+__global__ void kernel6(int* zerosandones, int* lengths, int* circlesthatpixelscareabout, int length) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index >= length) {
+        return;
+    }
+
+    int pixelIndex = index / cuConstRendererParams.numberOfCircles;
+    int circleIndex = index % cuConstRendererParams.numberOfCircles;
+
+    if (zerosandones[index] < zerosandones[index+1]) {
+        circlesthatpixelscareabout[lengths[pixelIndex] + zerosandones[index]] = circleIndex;
+    }
+
+}
+
+__global__ void kernel7(int* circlesthatpixelscareabout, int* lengths, int numPixels) {
+    // printf("\nHELLO\n");
+    int pixelIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (pixelIndex >= numPixels) {
+        return;
+    }
+
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    for (int i = lengths[pixelIndex]; i < lengths[pixelIndex + 1]; i++) {
+        int circleIndex = circlesthatpixelscareabout[i];
+
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+        int pixelY = pixelIndex / imageWidth;
+        int pixelX = pixelIndex % imageWidth;
+    
+        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+        
+        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                             invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+        shadePixel(pixelCenterNorm, p, imgPtr, circleIndex);
+        
+        // printf("%f, %f, %f, %f\n", imgPtr->x, imgPtr->y, imgPtr->z, imgPtr->w);
+    }
+}
+
+__device__ void circleTouch(float2 pixelCenter, int circleIndex, int* output, int index) {
+
+    // figure out if pixel is in circle at index
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[circleIndex * 3]);
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = cuConstRendererParams.radius[circleIndex];
+    float maxDist = rad * rad;
+
+    // pixel not in circle
+    if (pixelDist > maxDist) {
+        output[index] = 0;
+    }
+    else {
+        output[index] = 1;
+    }
+        
+}
+
+__global__ void kernel1(int* zeroesandones, int length) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index >= length) {
+        return;
+    }
+
+    int circleIndex = index % cuConstRendererParams.numberOfCircles;
+    int pixelIndex = index / cuConstRendererParams.numberOfCircles;
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    int pixelX = pixelIndex % imageWidth;
+    int pixelY = pixelIndex / imageWidth;
+
+    float2 pixelCenter = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    circleTouch(pixelCenter, circleIndex, zeroesandones, index);
+
+}
+
+
+__global__ void kernel3(int* zeroesandones, int length, int* zeroesandonessubtraction) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index == 0 || index >= length) {
+        return;
+    }
+
+    // find last thing from previous subarray
+
+    // int circleIndex = index % cuConstRendererParams.numberOfCircles;
+    int pixelIndex = (index - 1) / cuConstRendererParams.numberOfCircles;
+
+    int lastPrevious = (pixelIndex) * cuConstRendererParams.numberOfCircles;
+
+    zeroesandonessubtraction[index] = zeroesandones[index] - zeroesandones[lastPrevious];
+
+}
+
+static inline int nextPow2(int n)
+{
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
+
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
+    int numPixels = image->width * image->height;
+    int length = numPixels * numberOfCircles;
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    dim3 blockDim(256);
+    dim3 gridDim((length + blockDim.x - 1) / blockDim.x);
+
+    int* zerosandones;
+    int rounded_length = nextPow2(length + 1);
+    cudaMalloc((void**)&zerosandones, sizeof(int) * rounded_length);
+    cudaMemset(zerosandones + length, 0, sizeof(int));
+    kernel1<<<gridDim, blockDim>>>(zerosandones, length);
+
+    exclusive_scan(zerosandones, length + 1);
+
+    // int* zerosandonesHost = (int*) malloc(sizeof(int) * (length + 1));
+    // cudaMemcpy(zerosandonesHost, zerosandones, sizeof(int) * (length + 1), cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < length + 1; i++) {
+    //     printf("%d, ", zerosandonesHost[i]);
+    // }
+
+    int* zeroesandonessubtraction;
+    cudaMalloc((void**)&zeroesandonessubtraction, sizeof(int) * (length + 1));
+    dim3 gridDim5((length + 1 + blockDim.x - 1) / blockDim.x);
+    kernel3<<<gridDim5, blockDim>>>(zerosandones, length + 1, zeroesandonessubtraction);
+
+    // int* zerosandonesHost = (int*) malloc(sizeof(int) * (length + 1));
+    // cudaMemcpy(zerosandonesHost, zerosandones, sizeof(int) * (length + 1), cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < length + 1; i++) {
+    //     printf("%d, ", zerosandonesHost[i]);
+    // }
+
+    int* lengths;
+    int rounded_lengthPixels = nextPow2(numPixels + 1);
+    cudaMalloc((void**)&lengths, sizeof(int) * rounded_lengthPixels);
+    cudaMemset(lengths + numPixels, 0, sizeof(int));
+
+    dim3 gridDim2((numPixels + blockDim.x - 1) / blockDim.x);
+
+    kernel4<<<gridDim2, blockDim>>>(zerosandones, lengths, numPixels);
+    
+    // int* lengthsHost = (int*) malloc(sizeof(int) * (numPixels + 1));
+    // cudaMemcpy(lengthsHost, lengths, sizeof(int) * (numPixels + 1), cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < numPixels + 1; i++) {
+    //     printf("%d, ", lengthsHost[i]);
+    // }
+
+    exclusive_scan(lengths, numPixels + 1);
+
+    // int* lengthsHost = (int*) malloc(sizeof(int) * (numPixels + 1));
+    // cudaMemcpy(lengthsHost, lengths, sizeof(int) * (numPixels + 1), cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < numPixels + 1; i++) {
+    //     printf("%d, ", lengthsHost[i]);
+    // }
+
+    int* circlesthatpixelscareabout;
+    int circlesthatpixelscareaboutLength;
+    cudaMemcpy(&circlesthatpixelscareaboutLength, lengths + numPixels, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMalloc((void**)&circlesthatpixelscareabout, sizeof(int) * circlesthatpixelscareaboutLength);
+    
+    dim3 gridDim3((length + blockDim.x - 1) / blockDim.x);
+    kernel6<<<gridDim3, blockDim>>>(zerosandones, lengths, circlesthatpixelscareabout, length);
+
+    // int* circlesthatpixelscareaboutHost = (int*) malloc(sizeof(int) * circlesthatpixelscareaboutLength);
+    // cudaMemcpy(circlesthatpixelscareaboutHost, circlesthatpixelscareabout, sizeof(int) * circlesthatpixelscareaboutLength, cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < circlesthatpixelscareaboutLength; i++) {
+    //     printf("%d, ", circlesthatpixelscareaboutHost[i]);
+    // }
+
+    dim3 gridDim4((numPixels + blockDim.x - 1) / blockDim.x);
+    kernel7<<<gridDim4, blockDim>>>(circlesthatpixelscareabout, lengths, numPixels);
+
     cudaDeviceSynchronize();
 }
