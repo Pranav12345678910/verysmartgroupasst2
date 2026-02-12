@@ -970,6 +970,21 @@ static inline int nextPow2(int n)
     return n;
 }
 
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+    if (code != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 
 void
 CudaRenderer::render() {
@@ -982,8 +997,8 @@ CudaRenderer::render() {
 
     int* zerosandones;
     int rounded_length = nextPow2(length + 1);
-    cudaMalloc((void**)&zerosandones, sizeof(int) * rounded_length);
-    cudaMemset(zerosandones + length, 0, sizeof(int));
+    cudaCheckError(cudaMalloc((void**)&zerosandones, sizeof(int) * rounded_length));
+    cudaCheckError(cudaMemset(zerosandones + length, 0, sizeof(int)));
     kernel1<<<gridDim, blockDim>>>(zerosandones, length);
 
     exclusive_scan(zerosandones, length + 1);
@@ -995,9 +1010,10 @@ CudaRenderer::render() {
     // }
 
     int* zeroesandonessubtraction;
-    cudaMalloc((void**)&zeroesandonessubtraction, sizeof(int) * (length + 1));
+    cudaCheckError(cudaMalloc((void**)&zeroesandonessubtraction, sizeof(int) * (length + 1)));
     dim3 gridDim5((length + 1 + blockDim.x - 1) / blockDim.x);
     kernel3<<<gridDim5, blockDim>>>(zerosandones, length + 1, zeroesandonessubtraction);
+    cudaCheckError(cudaFree(zerosandones));
 
     // int* zerosandonesHost = (int*) malloc(sizeof(int) * (length + 1));
     // cudaMemcpy(zerosandonesHost, zerosandones, sizeof(int) * (length + 1), cudaMemcpyDeviceToHost);
@@ -1007,12 +1023,12 @@ CudaRenderer::render() {
 
     int* lengths;
     int rounded_lengthPixels = nextPow2(numPixels + 1);
-    cudaMalloc((void**)&lengths, sizeof(int) * rounded_lengthPixels);
-    cudaMemset(lengths + numPixels, 0, sizeof(int));
+    cudaCheckError(cudaMalloc((void**)&lengths, sizeof(int) * rounded_lengthPixels));
+    cudaCheckError(cudaMemset(lengths + numPixels, 0, sizeof(int)));
 
     dim3 gridDim2((numPixels + blockDim.x - 1) / blockDim.x);
 
-    kernel4<<<gridDim2, blockDim>>>(zerosandones, lengths, numPixels);
+    kernel4<<<gridDim2, blockDim>>>(zeroesandonessubtraction, lengths, numPixels);
     
     // int* lengthsHost = (int*) malloc(sizeof(int) * (numPixels + 1));
     // cudaMemcpy(lengthsHost, lengths, sizeof(int) * (numPixels + 1), cudaMemcpyDeviceToHost);
@@ -1030,11 +1046,11 @@ CudaRenderer::render() {
 
     int* circlesthatpixelscareabout;
     int circlesthatpixelscareaboutLength;
-    cudaMemcpy(&circlesthatpixelscareaboutLength, lengths + numPixels, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMalloc((void**)&circlesthatpixelscareabout, sizeof(int) * circlesthatpixelscareaboutLength);
+    cudaCheckError(cudaMemcpy(&circlesthatpixelscareaboutLength, lengths + numPixels, sizeof(int), cudaMemcpyDeviceToHost));
+    cudaCheckError(cudaMalloc((void**)&circlesthatpixelscareabout, sizeof(int) * circlesthatpixelscareaboutLength));
     
     dim3 gridDim3((length + blockDim.x - 1) / blockDim.x);
-    kernel6<<<gridDim3, blockDim>>>(zerosandones, lengths, circlesthatpixelscareabout, length);
+    kernel6<<<gridDim3, blockDim>>>(zeroesandonessubtraction, lengths, circlesthatpixelscareabout, length);
 
     // int* circlesthatpixelscareaboutHost = (int*) malloc(sizeof(int) * circlesthatpixelscareaboutLength);
     // cudaMemcpy(circlesthatpixelscareaboutHost, circlesthatpixelscareabout, sizeof(int) * circlesthatpixelscareaboutLength, cudaMemcpyDeviceToHost);
