@@ -58,6 +58,9 @@ __constant__ float  cuConstNoise1DValueTable[256];
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 
+#define TILE_SIZE 16
+
+
 // Include parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
@@ -692,6 +695,24 @@ int roundToPowerOf2(int input) {
 }
 
 
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+    if (code != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
+
+
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -724,7 +745,7 @@ void exclusive_scan(int* device_data, int length)
     int N = roundToPowerOf2(length);
 
     if (N > length) {
-        cudaMemset(device_data + length, 0, (N - length) * sizeof(int));
+        cudaCheckError(cudaMemset(device_data + length, 0, (N - length) * sizeof(int)));
     }
 
     // int threadsPerBlock = 256;
@@ -742,7 +763,7 @@ void exclusive_scan(int* device_data, int length)
         upSweep<<<blocks, threadsPerBlock>>>(device_data, twod1, twod, kernelCount);
     }
 
-    cudaMemset(device_data + (N - 1), 0, sizeof(int));
+    cudaCheckError(cudaMemset(device_data + (N - 1), 0, sizeof(int)));
 
     // downsweep phase.
     for (int twod = N/2; twod >= 1; twod /= 2)
@@ -829,34 +850,34 @@ __global__ void circleToucher(float2 pixelCenter, int* output) {
 //     }
 // }
 
-__global__ void kernel4(int* zerosandones, int* lengths, int numPixels) {
+__global__ void kernel4(int* zerosandones, int* lengths, int numTiles) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (index >= numPixels) {
+    if (index >= numTiles) {
         return;
     }
 
-    int numberCirclePixelIndex = (index + 1) * cuConstRendererParams.numberOfCircles;
-    lengths[index] = zerosandones[numberCirclePixelIndex];
+    int numberCircleTileIndex = (index + 1) * cuConstRendererParams.numberOfCircles;
+    lengths[index] = zerosandones[numberCircleTileIndex];
 }
 
-__global__ void kernel6(int* zerosandones, int* lengths, int* circlesthatpixelscareabout, int length) {
+__global__ void kernel6(int* zerosandones, int* lengths, int* circlesthattilescareabout, int length) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (index >= length) {
         return;
     }
 
-    int pixelIndex = index / cuConstRendererParams.numberOfCircles;
+    int tileIndex = index / cuConstRendererParams.numberOfCircles;
     int circleIndex = index % cuConstRendererParams.numberOfCircles;
 
     if (zerosandones[index] < zerosandones[index+1]) {
-        circlesthatpixelscareabout[lengths[pixelIndex] + zerosandones[index]] = circleIndex;
+        circlesthattilescareabout[lengths[tileIndex] + zerosandones[index]] = circleIndex;
     }
 
 }
 
-__global__ void kernel7(int* circlesthatpixelscareabout, int* lengths, int numPixels) {
+__global__ void kernel7(int* circlesthattilescareabout, int* lengths, int numPixels, int numXTiles) {
     // printf("\nHELLO\n");
     int pixelIndex = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -867,22 +888,38 @@ __global__ void kernel7(int* circlesthatpixelscareabout, int* lengths, int numPi
     int imageWidth = cuConstRendererParams.imageWidth;
     int imageHeight = cuConstRendererParams.imageHeight;
 
+    int pixelY = pixelIndex / imageWidth;
+    int pixelX = pixelIndex % imageWidth;
+
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
-    for (int i = lengths[pixelIndex]; i < lengths[pixelIndex + 1]; i++) {
-        int circleIndex = circlesthatpixelscareabout[i];
-
-        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
-        int pixelY = pixelIndex / imageWidth;
-        int pixelX = pixelIndex % imageWidth;
-    
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-        
-        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+    float2 pixelCenter = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                              invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-        shadePixel(pixelCenterNorm, p, imgPtr, circleIndex);
+    int tileX = pixelX / TILE_SIZE;
+    int tileY = pixelY / TILE_SIZE;
+    int tileIdx = tileY * numXTiles + tileX;
+
+
+    for (int i = lengths[tileIdx]; i < lengths[tileIdx + 1]; i++) {
+
+        int circleIndex = circlesthattilescareabout[i];
+
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);    
+
+        float diffX = p.x - pixelCenter.x;
+        float diffY = p.y - pixelCenter.y;
+        float pixelDist = diffX * diffX + diffY * diffY;
+
+        float rad = cuConstRendererParams.radius[circleIndex];
+        float maxDist = rad * rad;
+
+        // pixel not in circle
+        if (pixelDist <= maxDist) {
+            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+            shadePixel(pixelCenter, p, imgPtr, circleIndex);
+        }
         
         // printf("%f, %f, %f, %f\n", imgPtr->x, imgPtr->y, imgPtr->z, imgPtr->w);
     }
@@ -911,31 +948,53 @@ __device__ void circleTouch(float2 pixelCenter, int circleIndex, int* output, in
         
 }
 
-__global__ void kernel1(int* zeroesandones, int length) {
+__global__ void kernel1(int* zeroesandones, int length, int numXTiles) {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+
 
     if (index >= length) {
         return;
     }
 
     int circleIndex = index % cuConstRendererParams.numberOfCircles;
-    int pixelIndex = index / cuConstRendererParams.numberOfCircles;
+    int tileIndex = index / cuConstRendererParams.numberOfCircles;
 
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
+    // top left of the tile
+    int tileY = (tileIndex / numXTiles) * TILE_SIZE;
+    int tileX = (tileIndex % numXTiles) * TILE_SIZE;
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+    // check if that circle is in that tile 
+    float3 p = *(float3*)(&cuConstRendererParams.position[circleIndex * 3]);
 
-    int pixelX = pixelIndex % imageWidth;
-    int pixelY = pixelIndex / imageWidth;
+    float cx = p.x * imageWidth;
+    float cy = p.y * imageHeight;
 
-    float2 pixelCenter = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float rad = cuConstRendererParams.radius[circleIndex];
+    float rx = rad * imageWidth;
+    float ry = rad * imageHeight;
 
-    circleTouch(pixelCenter, circleIndex, zeroesandones, index);
+    float left   = cx - rx;
+    float right  = cx + rx;
+    float bottom = cy - ry;
+    float top    = cy + ry;
 
+    float tileL = tileX;
+    float tileR = tileX + TILE_SIZE;
+    float tileB = tileY;
+    float tileT = tileY + TILE_SIZE;
+
+    bool doesNotOverlap = (right < tileL || left > tileR || bottom > tileT || top < tileB);
+
+    if (!doesNotOverlap) {
+        zeroesandones[index] = 1;
+    }
+    else {
+        zeroesandones[index] = 0;
+    }
 }
 
 
@@ -943,16 +1002,19 @@ __global__ void kernel3(int* zeroesandones, int length, int* zeroesandonessubtra
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (index == 0 || index >= length) {
+    if (index >= length) {
         return;
+    }
+    
+    if (index == 0) {
+        zeroesandonessubtraction[index] = 0;
     }
 
     // find last thing from previous subarray
 
-    // int circleIndex = index % cuConstRendererParams.numberOfCircles;
-    int pixelIndex = (index - 1) / cuConstRendererParams.numberOfCircles;
+    int tileIndex = (index - 1) / cuConstRendererParams.numberOfCircles;
 
-    int lastPrevious = (pixelIndex) * cuConstRendererParams.numberOfCircles;
+    int lastPrevious = (tileIndex) * cuConstRendererParams.numberOfCircles;
 
     zeroesandonessubtraction[index] = zeroesandones[index] - zeroesandones[lastPrevious];
 
@@ -970,27 +1032,15 @@ static inline int nextPow2(int n)
     return n;
 }
 
-#define DEBUG
-#ifdef DEBUG
-#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
-inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-    if (code != cudaSuccess) {
-        fprintf(stderr, "CUDA Error: %s at %s:%d\n",
-        cudaGetErrorString(code), file, line);
-        if (abort) exit(code);
-    }
-}
-#else
-#define cudaCheckError(ans) ans
-#endif
-
-
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
+    int numXTiles = (image->width + TILE_SIZE - 1)/TILE_SIZE;
+    int numYTiles = (image->height + TILE_SIZE - 1)/TILE_SIZE;
+    int numTiles = numXTiles * numYTiles;
     int numPixels = image->width * image->height;
-    int length = numPixels * numberOfCircles;
+
+    int length = numTiles * numberOfCircles;
 
     dim3 blockDim(256);
     dim3 gridDim((length + blockDim.x - 1) / blockDim.x);
@@ -999,7 +1049,7 @@ CudaRenderer::render() {
     int rounded_length = nextPow2(length + 1);
     cudaCheckError(cudaMalloc((void**)&zerosandones, sizeof(int) * rounded_length));
     cudaCheckError(cudaMemset(zerosandones + length, 0, sizeof(int)));
-    kernel1<<<gridDim, blockDim>>>(zerosandones, length);
+    kernel1<<<gridDim, blockDim>>>(zerosandones, length, numXTiles);
 
     exclusive_scan(zerosandones, length + 1);
 
@@ -1022,13 +1072,13 @@ CudaRenderer::render() {
     // }
 
     int* lengths;
-    int rounded_lengthPixels = nextPow2(numPixels + 1);
-    cudaCheckError(cudaMalloc((void**)&lengths, sizeof(int) * rounded_lengthPixels));
-    cudaCheckError(cudaMemset(lengths + numPixels, 0, sizeof(int)));
+    int rounded_lengthTiles = nextPow2(numTiles + 1);
+    cudaCheckError(cudaMalloc((void**)&lengths, sizeof(int) * rounded_lengthTiles));
+    cudaCheckError(cudaMemset(lengths + numTiles, 0, sizeof(int)));
 
-    dim3 gridDim2((numPixels + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim2((numTiles + blockDim.x - 1) / blockDim.x);
 
-    kernel4<<<gridDim2, blockDim>>>(zeroesandonessubtraction, lengths, numPixels);
+    kernel4<<<gridDim2, blockDim>>>(zeroesandonessubtraction, lengths, numTiles);
     
     // int* lengthsHost = (int*) malloc(sizeof(int) * (numPixels + 1));
     // cudaMemcpy(lengthsHost, lengths, sizeof(int) * (numPixels + 1), cudaMemcpyDeviceToHost);
@@ -1036,7 +1086,7 @@ CudaRenderer::render() {
     //     printf("%d, ", lengthsHost[i]);
     // }
 
-    exclusive_scan(lengths, numPixels + 1);
+    exclusive_scan(lengths, numTiles + 1);
 
     // int* lengthsHost = (int*) malloc(sizeof(int) * (numPixels + 1));
     // cudaMemcpy(lengthsHost, lengths, sizeof(int) * (numPixels + 1), cudaMemcpyDeviceToHost);
@@ -1044,13 +1094,13 @@ CudaRenderer::render() {
     //     printf("%d, ", lengthsHost[i]);
     // }
 
-    int* circlesthatpixelscareabout;
-    int circlesthatpixelscareaboutLength;
-    cudaCheckError(cudaMemcpy(&circlesthatpixelscareaboutLength, lengths + numPixels, sizeof(int), cudaMemcpyDeviceToHost));
-    cudaCheckError(cudaMalloc((void**)&circlesthatpixelscareabout, sizeof(int) * circlesthatpixelscareaboutLength));
+    int* circlesthattilescareabout;
+    int circlesthattilescareaboutLength;
+    cudaCheckError(cudaMemcpy(&circlesthattilescareaboutLength, lengths + numTiles, sizeof(int), cudaMemcpyDeviceToHost));
+    cudaCheckError(cudaMalloc((void**)&circlesthattilescareabout, sizeof(int) * circlesthattilescareaboutLength));
     
     dim3 gridDim3((length + blockDim.x - 1) / blockDim.x);
-    kernel6<<<gridDim3, blockDim>>>(zeroesandonessubtraction, lengths, circlesthatpixelscareabout, length);
+    kernel6<<<gridDim3, blockDim>>>(zeroesandonessubtraction, lengths, circlesthattilescareabout, length);
 
     // int* circlesthatpixelscareaboutHost = (int*) malloc(sizeof(int) * circlesthatpixelscareaboutLength);
     // cudaMemcpy(circlesthatpixelscareaboutHost, circlesthatpixelscareabout, sizeof(int) * circlesthatpixelscareaboutLength, cudaMemcpyDeviceToHost);
@@ -1059,7 +1109,7 @@ CudaRenderer::render() {
     // }
 
     dim3 gridDim4((numPixels + blockDim.x - 1) / blockDim.x);
-    kernel7<<<gridDim4, blockDim>>>(circlesthatpixelscareabout, lengths, numPixels);
+    kernel7<<<gridDim4, blockDim>>>(circlesthattilescareabout, lengths, numPixels, numXTiles);
 
     cudaDeviceSynchronize();
 }
