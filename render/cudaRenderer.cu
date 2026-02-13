@@ -20,7 +20,8 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
-
+#include <thrust/scan.h>
+#include <thrust/device_ptr.h>
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -688,75 +689,10 @@ static inline int nextPow2(int n)
 }
 
 
-__global__ void upSweep(int* device_data, int twod1, int twod, int kernelCount)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < kernelCount) {
-        int i = twod1 * tid;
-        device_data[i + twod1 - 1] += device_data[i + twod - 1];
-    }
-
-}
-
-__global__ void downSweep(int* device_data, int twod1, int twod, int kernelCount)
-{
-    
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < kernelCount) {
-        int i = twod1 * tid;
-        int t = device_data[i + twod - 1];
-        device_data[i + twod - 1] = device_data[i + twod1 - 1];
-        device_data[i + twod1 - 1] += t;
-    }
-}
-
-
-
 void exclusive_scan(int* device_data, int length)
 {
-    /* TODO
-     * Fill in this function with your exclusive scan implementation.
-     * You are passed the locations of the data in device memory
-     * The data are initialized to the inputs.  Your code should
-     * do an in-place scan, generating the results in the same array.
-     * This is host code -- you will need to declare one or more CUDA
-     * kernels (with the __global__ decorator) in order to actually run code
-     * in parallel on the GPU.
-     * Note you are given the real length of the array, but may assume that
-     * both the data array is sized to accommodate the next
-     * power of 2 larger than the input.
-     */
-
-    int N = nextPow2(length);
-
-    if (N > length) {
-        cudaCheckError(cudaMemset(device_data + length, 0, (N - length) * sizeof(int)));
-    }
-
-    // upsweep phase.
-    for (int twod = 1; twod < N; twod*=2)
-    {
-        // we want N/twod1 runs of the loop
-        int twod1 = twod * 2;
-        int kernelCount = N/twod1;
-        int threadsPerBlock = 256;
-        int blocks = (kernelCount + threadsPerBlock - 1)/threadsPerBlock;
-
-        upSweep<<<blocks, threadsPerBlock>>>(device_data, twod1, twod, kernelCount);
-    }
-
-    cudaCheckError(cudaMemset(device_data + (N - 1), 0, sizeof(int)));
-
-    // downsweep phase.
-    for (int twod = N/2; twod >= 1; twod /= 2)
-    {
-        int twod1 = twod * 2;
-        int kernelCount = N/twod1;
-        int threadsPerBlock = 256;
-        int blocks = (kernelCount + threadsPerBlock - 1)/threadsPerBlock;
-
-        downSweep<<<blocks, threadsPerBlock>>>(device_data, twod1, twod, kernelCount);
-    }
+    thrust::device_ptr<int> dev_ptr(device_data);
+    thrust::exclusive_scan(dev_ptr, dev_ptr + length, dev_ptr);
 }
 
 
@@ -767,7 +703,6 @@ __global__ void kernel6(int* zerosandones, int* circlesthattilescareabout, int l
         return;
     }
 
-    int tileIndex = index / cuConstRendererParams.numberOfCircles;
     int circleIndex = index % cuConstRendererParams.numberOfCircles;
 
     if (zerosandones[index] < zerosandones[index+1]) {
@@ -846,39 +781,51 @@ __global__ void kernel7(int* circlesthattilescareabout, int* zerosandones, int n
                 float diffX = p.x - pixelCenter.x;
                 float diffY = p.y - pixelCenter.y;
                 float pixelDist = diffX * diffX + diffY * diffY;
-                
-                // if pixel inside circle 
-                if (pixelDist <= rad * rad) {
+                float maxDist = rad * rad;
 
+                // Circle does not contribute to the image
+                if (pixelDist <= maxDist) {
                     float3 rgb;
                     float alpha;
 
-                    if (cuConstRendererParams.sceneName == SNOWFLAKES || 
-                        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+                    // There is a non-zero contribution.  Now compute the shading value
+
+                    // Suggestion: This conditional is in the inner loop.  Although it
+                    // will evaluate the same for all threads, there is overhead in
+                    // setting up the lane masks, etc., to implement the conditional.  It
+                    // would be wise to perform this logic outside of the loops in
+                    // kernelRenderCircles.  (If feeling good about yourself, you
+                    // could use some specialized template magic).
+                    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+
+                        const float kCircleMaxAlpha = .5f;
+                        const float falloffScale = 4.f;
 
                         float normPixelDist = sqrt(pixelDist) / rad;
-                        rgb = lookupColor(normPixelDist); // Helper function already in .cu file
+                        rgb = lookupColor(normPixelDist);
 
-                        float kCircleMaxAlpha = .5f;
-                        float falloffScale = 4.f;
-                        float maxAlpha = .6f + .4f * (1.f - p.z);
-                        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                        float maxAlpha = .6f + .4f * (1.f-p.z);
+                        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
                         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
                     } else {
-                        // Standard Circle Logic
+                        // Simple: each circle has an assigned color
+                        int index3 = 3 * circleIndex;
                         rgb = sh_col[k];
-                        alpha = 0.5f;
+                        alpha = .5f;
                     }
 
                     float oneMinusAlpha = 1.f - alpha;
-                    
+
+                    // BEGIN SHOULD-BE-ATOMIC REGION
+                    // global memory read
+
                     img.x = alpha * rgb.x + oneMinusAlpha * img.x;
                     img.y = alpha * rgb.y + oneMinusAlpha * img.y;
                     img.z = alpha * rgb.z + oneMinusAlpha * img.z;
                     img.w = alpha + img.w;
-
                 }
+
             }
         }
 
